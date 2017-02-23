@@ -1,23 +1,25 @@
 using System;
-using System.Threading;
-using System.Threading.Tasks;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
-using Square.OkHttp;
-using Javax.Net.Ssl;
 using System.Text.RegularExpressions;
-using Java.IO;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Security.Cryptography.X509Certificates;
-using System.Globalization;
-using Android.OS;
+
+using Java.Interop;
+using Javax.Net.Ssl;
+using Java.Security;
+using Java.Security.Cert;
+
+using Square.OkHttp3;
 
 namespace ModernHttpClient
 {
-    public class NativeMessageHandler : HttpClientHandler
+	public class NativeMessageHandler : HttpClientHandler
     {
-        readonly OkHttpClient client = new OkHttpClient();
+        readonly OkHttpClient client;
         readonly CacheControl noCacheCacheControl = default(CacheControl);
         readonly bool throwOnCaptiveNetwork;
 
@@ -36,11 +38,25 @@ namespace ModernHttpClient
         {
             this.throwOnCaptiveNetwork = throwOnCaptiveNetwork;
 
-            if (customSSLVerification) client.SetHostnameVerifier(new HostnameVerifier());
-            noCacheCacheControl = (new CacheControl.Builder()).NoCache().Build();
+			if (customSSLVerification)
+			{
+				var tm = new CustomX509TrustManager();
+				var sslCtx = SSLContext.GetInstance("TLSv1.2");
+				sslCtx.Init(null, new ITrustManager[] { tm }, null);
+
+				client = new OkHttpClient.Builder()
+					.HostnameVerifier(new HostnameVerifier())
+					.SslSocketFactory(sslCtx.SocketFactory, tm)
+					.Build();
+			}
+			else
+				client = new OkHttpClient();
+
+
+			noCacheCacheControl = (new CacheControl.Builder()).NoCache().Build();
         }
 
-        public void RegisterForProgress(HttpRequestMessage request, ProgressDelegate callback)
+		public void RegisterForProgress(HttpRequestMessage request, ProgressDelegate callback)
         {
             if (callback == null && registeredProgressCallbacks.ContainsKey(request)) {
                 registeredProgressCallbacks.Remove(request);
@@ -77,7 +93,7 @@ namespace ModernHttpClient
             return ",";
         }
 
-        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+		protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
             var java_uri = request.RequestUri.GetComponents(UriComponents.AbsoluteUri, UriFormat.UriEscaped);
             var url = new Java.Net.URL(java_uri);
@@ -106,7 +122,8 @@ namespace ModernHttpClient
                     (IEnumerable<KeyValuePair<string, IEnumerable<string>>>)request.Content.Headers :
                     Enumerable.Empty<KeyValuePair<string, IEnumerable<string>>>());
 
-            foreach (var kvp in keyValuePairs) builder.AddHeader(kvp.Key, String.Join(getHeaderSeparator(kvp.Key), kvp.Value));
+            foreach (var kvp in keyValuePairs)
+				builder.AddHeader(kvp.Key, String.Join(getHeaderSeparator(kvp.Key), kvp.Value));
 
             cancellationToken.ThrowIfCancellationRequested();
 
@@ -116,18 +133,17 @@ namespace ModernHttpClient
             // NB: Even closing a socket must be done off the UI thread. Cray!
             cancellationToken.Register(() => Task.Run(() => call.Cancel()));
 
-			var resp = await call.EnqueueAsync().ConfigureAwait(false);
-			var newReq = resp.Request();
-			var newUri = newReq == null ? null : newReq.Uri();
-			request.RequestUri = new Uri(newUri.ToString());
+			var resp = await call.ExecuteAsync().ConfigureAwait(false);
 
-			if (throwOnCaptiveNetwork && newUri != null)
-			{
-				if (url.Host != newUri.Host)
-					throw new CaptiveNetworkException(new Uri(java_uri), new Uri(newUri.ToString()));
-			}
-			
-			var respBody = resp.Body();
+			var newReq = resp.Request();
+            var newUri = newReq == null ? null : newReq.Url();
+            request.RequestUri = new Uri(newUri.ToString());
+            if (throwOnCaptiveNetwork
+				&& newUri != null
+				&& url.Host != newUri.Host())
+                    throw new CaptiveNetworkException(new Uri(java_uri), new Uri(newUri.ToString()));
+
+            var respBody = resp.Body();
 
             cancellationToken.ThrowIfCancellationRequested();
 
@@ -152,111 +168,161 @@ namespace ModernHttpClient
         }
     }
 
-    public static class AwaitableOkHttp
+	internal class HostnameVerifier : Java.Lang.Object, IHostnameVerifier
+	{
+		internal static readonly Regex cnRegex = new Regex(@"CN\s*=\s*([^,]*)", RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.Singleline);
+
+		public bool Verify(string hostname, ISSLSession session)
+		{
+			if (ServicePointManager.ServerCertificateValidationCallback == null)
+				return HttpsURLConnection.DefaultHostnameVerifier.Verify(hostname, session);
+
+
+			// Convert java certificates to .NET certificates and build cert chain from root certificate
+			var certificates = session.GetPeerCertificateChain();
+			// these are                       Javax.Security.Cert.X509Certificates
+			// this class is actually obsolete, Java.Security.Cert.X509Certificate should be used instead
+
+			var chain = new X509Chain();
+			X509Certificate2 root = null;
+			var errors = System.Net.Security.SslPolicyErrors.None;
+
+			// Build certificate chain and check for errors
+			if (certificates == null || certificates.Length == 0)
+			{//no cert at all
+				errors = System.Net.Security.SslPolicyErrors.RemoteCertificateNotAvailable;
+				goto bail;
+			}
+
+			var netCerts = certificates.Select(x => new X509Certificate2(x.GetEncoded())).ToArray();
+
+			for (int i = 1; i < netCerts.Length; i++)
+				chain.ChainPolicy.ExtraStore.Add(netCerts[i]);
+
+			root = netCerts[0];
+
+			chain.ChainPolicy.RevocationFlag = X509RevocationFlag.EntireChain;
+			chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+			chain.ChainPolicy.UrlRetrievalTimeout = new TimeSpan(0, 1, 0);
+			chain.ChainPolicy.VerificationFlags = X509VerificationFlags.AllowUnknownCertificateAuthority;
+
+			if (!chain.Build(root))
+			{
+				errors = System.Net.Security.SslPolicyErrors.RemoteCertificateChainErrors;
+				goto bail;
+			}
+
+			var subject = root.Subject;
+			var subjectCn = cnRegex.Match(subject).Groups[1].Value;
+
+			if (String.IsNullOrWhiteSpace(subjectCn) || !Utility.MatchHostnameToPattern(hostname, subjectCn))
+			{
+				errors = System.Net.Security.SslPolicyErrors.RemoteCertificateNameMismatch;
+				goto bail;
+			}
+
+			bail:
+			// Call the delegate to validate
+			return ServicePointManager.ServerCertificateValidationCallback(hostname, root, chain, errors);
+		}
+	}
+
+	internal class CustomX509TrustManager : Java.Lang.Object, IX509TrustManager
     {
-        public static Task<Response> EnqueueAsync(this Call This)
-        {
-            var cb = new OkTaskCallback();
-            This.Enqueue(cb);
-
-            return cb.Task;
-        }
-
-        class OkTaskCallback : Java.Lang.Object, ICallback
-        {
-            readonly TaskCompletionSource<Response> tcs = new TaskCompletionSource<Response>();
-            public Task<Response> Task { get { return tcs.Task; } }
-
-            public void OnFailure(Request p0, Java.IO.IOException p1)
-            {
-                // Kind of a hack, but the simplest way to find out that server cert. validation failed
-                if (p1.Message == String.Format("Hostname '{0}' was not verified", p0.Url().Host)) {
-                    tcs.TrySetException(new WebException(p1.LocalizedMessage, WebExceptionStatus.TrustFailure));
-				}
-				else if (p1.Message.ToLowerInvariant().Contains("canceled"))
+		private IX509TrustManager defaultTrustManager;
+		private IX509TrustManager DefaultTrustManager
+		{
+			get
+			{
+				if(defaultTrustManager == null)
 				{
-					tcs.TrySetException(new System.OperationCanceledException());
-				} else {
-                    tcs.TrySetException(new WebException(p1.Message));
-                }
-            }
+					var algorithm = TrustManagerFactory.DefaultAlgorithm;
+					var defaultTrustManagerFactory = TrustManagerFactory.GetInstance(algorithm);
+					defaultTrustManagerFactory.Init((KeyStore)null);
+					var trustManagers = defaultTrustManagerFactory.GetTrustManagers();
+					defaultTrustManager = trustManagers[0].JavaCast<IX509TrustManager>();
+				}
+				return defaultTrustManager;
+			}
+		}
 
-            public void OnResponse(Response p0)
-            {
-                tcs.TrySetResult(p0);
-            }
-        }
-    }
-
-    class HostnameVerifier : Java.Lang.Object, IHostnameVerifier
-    {
-        static readonly Regex cnRegex = new Regex(@"CN\s*=\s*([^,]*)", RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.Singleline);
-
-        public bool Verify(string hostname, ISSLSession session)
+        public void CheckClientTrusted(Java.Security.Cert.X509Certificate[] chain, string authType)
         {
-            return verifyServerCertificate(hostname, session);
+            // we are the client
         }
 
-        /// <summary>
-        /// Verifies the server certificate by calling into ServicePointManager.ServerCertificateValidationCallback or,
-        /// if the is no delegate attached to it by using the default hostname verifier.
-        /// </summary>
-        /// <returns><c>true</c>, if server certificate was verifyed, <c>false</c> otherwise.</returns>
-        /// <param name="hostname"></param>
-        /// <param name="session"></param>
-        static bool verifyServerCertificate(string hostname, ISSLSession session)
+        public void CheckServerTrusted(Java.Security.Cert.X509Certificate[] certificates, string authType)
         {
-            var defaultVerifier = HttpsURLConnection.DefaultHostnameVerifier;
+			if (ServicePointManager.ServerCertificateValidationCallback == null)
+			{
+				DefaultTrustManager.CheckServerTrusted(certificates, authType);
+			}
+			else
+			{
+				// create parameters like in HostnameVerifier.verifyServerCertificate
+				// unfortunately I cannot share the code because I have a Javax.Security.Cert.X509Certificate[] there 
+				// and a                                                   Java.Security.Cert.X509Certificate[] here.
 
-            if (ServicePointManager.ServerCertificateValidationCallback == null) return defaultVerifier.Verify(hostname, session);
+				// convert Java.Security.Cert.X509Certificate[] chain
+				// to System.Security.Cryptography.X509Certificates.X509Certificate and System.Security.Cryptography.X509Certificates.X509Chain
 
-            // Convert java certificates to .NET certificates and build cert chain from root certificate
-            var certificates = session.GetPeerCertificateChain();
-            var chain = new X509Chain();
-            X509Certificate2 root = null;
-            var errors = System.Net.Security.SslPolicyErrors.None;
 
-            // Build certificate chain and check for errors
-            if (certificates == null || certificates.Length == 0) {//no cert at all
-                errors = System.Net.Security.SslPolicyErrors.RemoteCertificateNotAvailable;
-                goto bail;
-            }
+				string hostname = "?";
+				X509Certificate2 root = null;
+				var chain = new X509Chain();
+				var errors = System.Net.Security.SslPolicyErrors.None;
 
-			// this disables self signed certificates
-			//if (certificates.Length == 1) {//no root?
-   //             errors = System.Net.Security.SslPolicyErrors.RemoteCertificateChainErrors;
-   //             goto bail;
-   //         } 
+				// Build certificate chain and check for errors
+				if (certificates == null || certificates.Length == 0)
+				{   //no cert at all
+					errors = System.Net.Security.SslPolicyErrors.RemoteCertificateNotAvailable;
+					goto bail;
+				}
 
-            var netCerts = certificates.Select(x => new X509Certificate2(x.GetEncoded())).ToArray();
+				var netCerts = certificates.Select(x => new X509Certificate2(x.GetEncoded())).ToArray();
 
-            for (int i = 1; i < netCerts.Length; i++) {
-                chain.ChainPolicy.ExtraStore.Add(netCerts[i]);
-            }
+				for (int i = 1; i < netCerts.Length; i++)
+					chain.ChainPolicy.ExtraStore.Add(netCerts[i]);
 
-            root = netCerts[0];
+				root = netCerts[0];
 
-            chain.ChainPolicy.RevocationFlag = X509RevocationFlag.EntireChain;
-            chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
-            chain.ChainPolicy.UrlRetrievalTimeout = new TimeSpan(0, 1, 0);
-            chain.ChainPolicy.VerificationFlags = X509VerificationFlags.AllowUnknownCertificateAuthority;
+				chain.ChainPolicy.RevocationFlag = X509RevocationFlag.EntireChain;
+				chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+				chain.ChainPolicy.UrlRetrievalTimeout = new TimeSpan(0, 1, 0);
+				chain.ChainPolicy.VerificationFlags = X509VerificationFlags.AllowUnknownCertificateAuthority;
 
-            if (!chain.Build(root)) {
-                errors = System.Net.Security.SslPolicyErrors.RemoteCertificateChainErrors;
-                goto bail;
-            }
+				if (!chain.Build(root))
+				{
+					errors = System.Net.Security.SslPolicyErrors.RemoteCertificateChainErrors;
+					goto bail;
+				}
 
-            var subject = root.Subject;
-            var subjectCn = cnRegex.Match(subject).Groups[1].Value;
+				// I don't have the hostname here, so I can't verify it.
+				// but I can read it from the certificate and use as sender
+				var subject = root.Subject;
+				hostname = HostnameVerifier.cnRegex.Match(subject).Groups[1].Value;
 
-            if (String.IsNullOrWhiteSpace(subjectCn) || !Utility.MatchHostnameToPattern(hostname, subjectCn)) {
-                errors = System.Net.Security.SslPolicyErrors.RemoteCertificateNameMismatch;
-                goto bail;
-            }
+				//var subject = root.Subject;
+				//var subjectCn = cnRegex.Match(subject).Groups[1].Value;
 
-        bail:
-            // Call the delegate to validate
-            return ServicePointManager.ServerCertificateValidationCallback(hostname, root, chain, errors);
+				//if (String.IsNullOrWhiteSpace(subjectCn) || !Utility.MatchHostnameToPattern(hostname, subjectCn))
+				//{
+				//	errors = System.Net.Security.SslPolicyErrors.RemoteCertificateNameMismatch;
+				//	goto bail;
+				//}
+
+				bail:
+				var isValid = ServicePointManager.ServerCertificateValidationCallback(hostname, root, chain, errors);
+				if (isValid)
+					return;
+
+				throw new CertificateException("Server certificate is not trusted.");
+			}
+        }
+
+        Java.Security.Cert.X509Certificate[] IX509TrustManager.GetAcceptedIssuers()
+        {
+            return new Java.Security.Cert.X509Certificate[0];
         }
     }
 }

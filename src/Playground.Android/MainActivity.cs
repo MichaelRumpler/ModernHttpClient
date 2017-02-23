@@ -34,7 +34,7 @@ namespace Playground.Android
             RunOnUiThread(() => {
                 progress.Max = 10000;
 
-                var progressPercent = (float)totalBytes / (float)totalBytesExpected;
+                var progressPercent = totalBytesExpected == 0 ? 100.0f : (float)totalBytes / (float)totalBytesExpected;
                 var progressOffset = Convert.ToInt32(progressPercent * 10000);
 
                 Console.WriteLine(progressOffset);
@@ -55,7 +55,7 @@ namespace Playground.Android
 
                 foreach(var el in chain.ChainElements) {
                     System.Diagnostics.Debug.WriteLine(el.Certificate.GetCertHashString());
-                    System.Diagnostics.Debug.WriteLine(el.Information);
+                    System.Diagnostics.Debug.WriteLine(el.Certificate.Subject);
                 }
 
                 return true;
@@ -76,10 +76,11 @@ namespace Playground.Android
                 Console.WriteLine("Canceled token {0:x8}", this.currentToken.Token.GetHashCode());
                 this.currentToken.Cancel();
                 if (resp != null) resp.Content.Dispose();
-            };
+				result.Text = string.Empty;
+			};
 
             button.Click += async (o, e) => {
-                var handler = new NativeMessageHandler();
+                var handler = new NativeMessageHandler(false, true);
                 var client = new HttpClient(handler);
 
                 currentToken = new CancellationTokenSource();
@@ -91,11 +92,14 @@ namespace Playground.Android
 
                 st.Start();
                 try {
-                    //var url = "https://tv.eurosport.com";
-                    //var url = "https://github.com/downloads/nadlabak/android/cm-9.1.0a-umts_sholes.zip";
-                    var url = "https://github.com/paulcbetts/ModernHttpClient/releases/download/0.9.0/ModernHttpClient-0.9.zip";
+					//var url = "https://tv.eurosport.com";
+					//var url = "https://github.com/downloads/nadlabak/android/cm-9.1.0a-umts_sholes.zip";
+					var url = "https://github.com/paulcbetts/ModernHttpClient/releases/download/0.9.0/ModernHttpClient-0.9.zip";
+					//var url = "https://self-signed.badssl.com/";
+					//var url = "https://code4ward.ddns.net:54899/status";		// switch to /status once the server has been updated
 
-                    var request = new HttpRequestMessage(HttpMethod.Get, url);
+
+					var request = new HttpRequestMessage(HttpMethod.Get, url);
                     handler.RegisterForProgress(request, HandleDownloadProgress);
 
                     resp = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, currentToken.Token);
@@ -103,19 +107,22 @@ namespace Playground.Android
 
                     status.Text = string.Format("HTTP {0}: {1}", (int)resp.StatusCode, resp.ReasonPhrase);
 
-                    foreach (var v in resp.Headers) {
-                        Console.WriteLine("{0}: {1}", v.Key, String.Join(",", v.Value));
-                    }
+					var sb = new StringBuilder();
+					foreach (var v in resp.Headers)
+						sb.AppendFormat("{0}: {1}\n", v.Key, String.Join(",", v.Value));
+					sb.AppendLine();
 
-                    var stream = await resp.Content.ReadAsStreamAsync();
+					var stream = await resp.Content.ReadAsStreamAsync();
 
                     var ms = new MemoryStream();
                     await stream.CopyToAsync(ms, 4096, currentToken.Token);
                     var bytes = ms.ToArray();
 
-                    result.Text = String.Format("Read {0} bytes", bytes.Length);
+					sb.Append($"Body has {bytes.Length} bytes.");
 
-                    var md5 = MD5.Create();
+					result.Text = sb.ToString();
+
+					var md5 = MD5.Create();
                     var hash = md5.ComputeHash(bytes);
                     hashView.Text = ToHex(hash, false);
                 } catch (Exception ex) {
