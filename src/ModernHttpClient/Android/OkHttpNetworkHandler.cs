@@ -170,19 +170,19 @@ namespace ModernHttpClient
 
 	internal class HostnameVerifier : Java.Lang.Object, IHostnameVerifier
 	{
-		internal static readonly Regex cnRegex = new Regex(@"CN\s*=\s*([^,]*)", RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.Singleline);
+		static readonly Regex cnRegex = new Regex(@"CN\s*=\s*([^,]*)", RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.Singleline);
 
 		public bool Verify(string hostname, ISSLSession session)
 		{
 			if (ServicePointManager.ServerCertificateValidationCallback == null)
 				return HttpsURLConnection.DefaultHostnameVerifier.Verify(hostname, session);
 
+			var certificates = session.GetPeerCertificates();
+			return Verify(certificates, hostname);
+		}
 
-			// Convert java certificates to .NET certificates and build cert chain from root certificate
-			var certificates = session.GetPeerCertificateChain();
-			// these are                       Javax.Security.Cert.X509Certificates
-			// this class is actually obsolete, Java.Security.Cert.X509Certificate should be used instead
-
+		public static bool Verify(Certificate[] certificates, string hostname = null)
+		{
 			var chain = new X509Chain();
 			X509Certificate2 root = null;
 			var errors = System.Net.Security.SslPolicyErrors.None;
@@ -214,11 +214,19 @@ namespace ModernHttpClient
 
 			var subject = root.Subject;
 			var subjectCn = cnRegex.Match(subject).Groups[1].Value;
-
-			if (String.IsNullOrWhiteSpace(subjectCn) || !Utility.MatchHostnameToPattern(hostname, subjectCn))
+			if (hostname != null)
 			{
-				errors = System.Net.Security.SslPolicyErrors.RemoteCertificateNameMismatch;
-				goto bail;
+				if (String.IsNullOrWhiteSpace(subjectCn) || !Utility.MatchHostnameToPattern(hostname, subjectCn))
+				{
+					errors = System.Net.Security.SslPolicyErrors.RemoteCertificateNameMismatch;
+					goto bail;
+				}
+			}
+			else
+			{
+				// I don't have the hostname here, so I can't verify it.
+				// but I can read it from the certificate and use as sender
+				hostname = subjectCn;
 			}
 
 			bail:
@@ -259,64 +267,9 @@ namespace ModernHttpClient
 			}
 			else
 			{
-				// create parameters like in HostnameVerifier.verifyServerCertificate
-				// unfortunately I cannot share the code because I have a Javax.Security.Cert.X509Certificate[] there 
-				// and a                                                   Java.Security.Cert.X509Certificate[] here.
-
-				// convert Java.Security.Cert.X509Certificate[] chain
-				// to System.Security.Cryptography.X509Certificates.X509Certificate and System.Security.Cryptography.X509Certificates.X509Chain
-
-
-				string hostname = "?";
-				X509Certificate2 root = null;
-				var chain = new X509Chain();
-				var errors = System.Net.Security.SslPolicyErrors.None;
-
-				// Build certificate chain and check for errors
-				if (certificates == null || certificates.Length == 0)
-				{   //no cert at all
-					errors = System.Net.Security.SslPolicyErrors.RemoteCertificateNotAvailable;
-					goto bail;
-				}
-
-				var netCerts = certificates.Select(x => new X509Certificate2(x.GetEncoded())).ToArray();
-
-				for (int i = 1; i < netCerts.Length; i++)
-					chain.ChainPolicy.ExtraStore.Add(netCerts[i]);
-
-				root = netCerts[0];
-
-				chain.ChainPolicy.RevocationFlag = X509RevocationFlag.EntireChain;
-				chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
-				chain.ChainPolicy.UrlRetrievalTimeout = new TimeSpan(0, 1, 0);
-				chain.ChainPolicy.VerificationFlags = X509VerificationFlags.AllowUnknownCertificateAuthority;
-
-				if (!chain.Build(root))
-				{
-					errors = System.Net.Security.SslPolicyErrors.RemoteCertificateChainErrors;
-					goto bail;
-				}
-
-				// I don't have the hostname here, so I can't verify it.
-				// but I can read it from the certificate and use as sender
-				var subject = root.Subject;
-				hostname = HostnameVerifier.cnRegex.Match(subject).Groups[1].Value;
-
-				//var subject = root.Subject;
-				//var subjectCn = cnRegex.Match(subject).Groups[1].Value;
-
-				//if (String.IsNullOrWhiteSpace(subjectCn) || !Utility.MatchHostnameToPattern(hostname, subjectCn))
-				//{
-				//	errors = System.Net.Security.SslPolicyErrors.RemoteCertificateNameMismatch;
-				//	goto bail;
-				//}
-
-				bail:
-				var isValid = ServicePointManager.ServerCertificateValidationCallback(hostname, root, chain, errors);
-				if (isValid)
-					return;
-
-				throw new CertificateException("Server certificate is not trusted.");
+				var isvalid = HostnameVerifier.Verify(certificates);
+				if(!isvalid)
+					throw new CertificateException("Server certificate is not trusted.");
 			}
         }
 
