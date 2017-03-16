@@ -6,3 +6,6 @@ build/
 build/
 *.xam
 packages
+*.user
+*.bak
+*.suo

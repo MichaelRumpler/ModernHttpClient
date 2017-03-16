@@ -58,7 +58,7 @@ namespace Playground.Android
                     System.Diagnostics.Debug.WriteLine(el.Certificate.Subject);
                 }
 
-                return true;
+                return false;
             };
 
             // Get our button from the layout resource,
@@ -94,8 +94,8 @@ namespace Playground.Android
                 try {
 					//var url = "https://tv.eurosport.com";
 					//var url = "https://github.com/downloads/nadlabak/android/cm-9.1.0a-umts_sholes.zip";
-					var url = "https://github.com/paulcbetts/ModernHttpClient/releases/download/0.9.0/ModernHttpClient-0.9.zip";
-					//var url = "https://self-signed.badssl.com/";
+					//var url = "https://github.com/paulcbetts/ModernHttpClient/releases/download/0.9.0/ModernHttpClient-0.9.zip";
+					var url = "https://self-signed.badssl.com/";
 					//var url = "https://code4ward.ddns.net:54899/status";		// switch to /status once the server has been updated
 
 

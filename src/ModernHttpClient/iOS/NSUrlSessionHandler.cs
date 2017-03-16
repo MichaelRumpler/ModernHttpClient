@@ -261,8 +261,6 @@ namespace ModernHttpClient
 
             public override void DidReceiveChallenge(NSUrlSession session, NSUrlSessionTask task, NSUrlAuthenticationChallenge challenge, Action<NSUrlSessionAuthChallengeDisposition, NSUrlCredential> completionHandler)
             {
-               
-
                 if (challenge.ProtectionSpace.AuthenticationMethod == NSUrlProtectionSpace.AuthenticationMethodNTLM) {
                     NetworkCredential credentialsToUse;
 
@@ -337,9 +335,8 @@ namespace ModernHttpClient
                     goto sslErrorVerify;
                 }
 
-            sslErrorVerify:
-                var hostname = task.CurrentRequest.Url.Host;
-                bool result = ServicePointManager.ServerCertificateValidationCallback(hostname, root, chain, errors);
+			sslErrorVerify:
+				bool result = ServicePointManager.ServerCertificateValidationCallback(getResponseForTask(task).Request, root, chain, errors);
                 if (result) {
                     completionHandler(
                         NSUrlSessionAuthChallengeDisposition.UseCredential,
