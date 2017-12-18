@@ -14,6 +14,7 @@ using Java.Security;
 using Java.Security.Cert;
 
 using Square.OkHttp3;
+using Java.IO;
 
 namespace ModernHttpClient
 {
@@ -133,7 +134,17 @@ namespace ModernHttpClient
             // NB: Even closing a socket must be done off the UI thread. Cray!
             cancellationToken.Register(() => Task.Run(() => call.Cancel()));
 
-			var resp = await call.ExecuteAsync().ConfigureAwait(false);
+			Response resp = null;
+			try
+			{
+				resp = call.Execute();
+				//resp = await call.EnqueueAsync().ConfigureAwait(false);
+			}
+			catch(Exception ex)
+			{
+				System.Console.WriteLine("Exception from EnqueueAsync!\n" + ex.ToString());
+				throw;
+			}
 
 			var newReq = resp.Request();
             var newUri = newReq == null ? null : newReq.Url();
@@ -167,6 +178,45 @@ namespace ModernHttpClient
             return ret;
         }
     }
+
+	public static class AwaitableOkHttp
+	{
+		public static Task<Response> EnqueueAsync(this ICall This)
+		{
+			var cb = new OkTaskCallback();
+			This.Enqueue(cb);
+
+			return cb.Task;
+		}
+
+		class OkTaskCallback : Java.Lang.Object, ICallback
+		{
+			readonly TaskCompletionSource<Response> tcs = new TaskCompletionSource<Response>();
+			public Task<Response> Task { get { return tcs.Task; } }
+
+			public void OnFailure(ICall p0, IOException p1)
+			{
+				// Kind of a hack, but the simplest way to find out that server cert. validation failed
+				if (p1.Message == String.Format("Hostname '{0}' was not verified", p0.Request().Url().Host()))
+				{
+					tcs.TrySetException(new WebException(p1.LocalizedMessage, WebExceptionStatus.TrustFailure));
+				}
+				else if (p1.Message.ToLowerInvariant().Contains("canceled"))
+				{
+					tcs.TrySetException(new OperationCanceledException());
+				}
+				else
+				{
+					tcs.TrySetException(new WebException(p1.Message));
+				}
+			}
+
+			public void OnResponse(ICall p0, Response p1)
+			{
+				tcs.TrySetResult(p1);
+			}
+		}
+	}
 
 	internal class HostnameVerifier : Java.Lang.Object, IHostnameVerifier
 	{
@@ -269,7 +319,7 @@ namespace ModernHttpClient
 			{
 				var isvalid = HostnameVerifier.Verify(certificates);
 				if(!isvalid)
-					throw new CertificateException("Server certificate is not trusted.");
+					throw new Java.Security.Cert.CertificateException("Server certificate is not trusted.");       // SSLHandshakeException doesn't work either
 			}
         }
 
